@@ -1,0 +1,559 @@
+"""FastAPI application: routes, video streaming, exports, comments, history."""
+import json
+import re
+import secrets
+from pathlib import Path
+from urllib.parse import quote
+
+from fastapi import (
+    Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile,
+)
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+
+from . import auth, jobs, storage
+from .config import (
+    ALLOWED_DOMAIN, ANALYSES_DIR, MAX_UPLOAD_BYTES,
+    SESSION_HTTPS_ONLY, SESSION_MAX_AGE, SESSION_SECRET,
+)
+
+app = FastAPI(title='VO and Visual Extractor', docs_url=None, redoc_url=None)
+
+# Signed-cookie session storage. Survives PM2 restarts (in-memory dicts don't).
+# `secret_key` MUST be set in production — used to sign the session cookie.
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET or secrets.token_urlsafe(32),
+    max_age=SESSION_MAX_AGE,
+    same_site='lax',
+    https_only=SESSION_HTTPS_ONLY,
+)
+
+storage.init_db()
+storage.mark_orphan_jobs_failed()
+jobs.start_worker()
+
+STATIC_DIR = Path(__file__).parent / 'static'
+app.mount('/static', StaticFiles(directory=str(STATIC_DIR)), name='static')
+
+_VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.flv', '.wmv',
+               '.mpg', '.mpeg', '.3gp', '.m4v'}
+
+
+# ── Pages ─────────────────────────────────────────────────────────────────────
+
+@app.get('/healthz')
+async def healthz():
+    return {"ok": True}
+
+
+@app.get('/favicon.ico')
+async def favicon():
+    """Browsers auto-request /favicon.ico without reading the HTML. Hand back
+    the AVIF logo so we don't pollute logs with 404s; modern browsers accept
+    AVIF served at the .ico path."""
+    return FileResponse(str(STATIC_DIR / 'favicon.avif'), media_type='image/avif')
+
+
+_NOCACHE = {'Cache-Control': 'no-store, must-revalidate', 'Pragma': 'no-cache'}
+
+
+@app.get('/')
+async def root(request: Request):
+    page = 'index.html' if auth.is_authenticated(request) else 'login.html'
+    return FileResponse(STATIC_DIR / page, headers=_NOCACHE)
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+@app.get('/api/me')
+async def api_me(request: Request):
+    user = auth.get_user(request)
+    return {
+        "authenticated": auth.is_authenticated(request),
+        "auth_required": auth.auth_enabled(),
+        "user": user,
+    }
+
+
+@app.get('/login')
+async def login(request: Request):
+    """Start the Google OAuth flow. Unauthenticated users land here from the
+    "Sign in with Google" button on the login page."""
+    if not auth.auth_enabled():
+        return RedirectResponse('/')
+    if auth.is_authenticated(request):
+        return RedirectResponse('/')
+    state = secrets.token_urlsafe(24)
+    request.session['oauth_state'] = state
+    return RedirectResponse(auth.build_google_auth_url(state))
+
+
+@app.get('/auth/callback')
+async def auth_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    """Google redirects the user back here after sign-in."""
+    if error:
+        return RedirectResponse(f'/?error={quote(error)}')
+    if not code:
+        raise HTTPException(400, "Missing authorization code")
+
+    expected_state = request.session.pop('oauth_state', None)
+    if not expected_state or state != expected_state:
+        raise HTTPException(400, "Invalid OAuth state (possible CSRF). Try signing in again.")
+
+    try:
+        tokens = auth.exchange_code(code)
+        if 'id_token' not in tokens:
+            raise HTTPException(401, "Google did not return an id_token")
+        info = auth.verify_id_token(tokens['id_token'])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(401, f"Failed to verify Google sign-in: {e}")
+
+    email = info.get('email', '')
+    hd = info.get('hd')
+    if not auth.domain_ok(email, hd):
+        msg = (
+            f"Account {email or '(unknown)'} is not authorized. "
+            f"Only @{ALLOWED_DOMAIN} accounts can sign in."
+        )
+        return RedirectResponse(f'/?error={quote(msg)}')
+
+    request.session['user'] = {
+        'email': email,
+        'name': info.get('name', email),
+        'picture': info.get('picture', ''),
+    }
+    return RedirectResponse('/')
+
+
+@app.post('/api/logout')
+async def api_logout(request: Request):
+    request.session.clear()
+    return {"ok": True}
+
+
+# /api/me already exists earlier in this file — the older route returns
+# {authenticated, auth_required, user: {email, name, picture}}.
+
+
+# ── History + storage ────────────────────────────────────────────────────────
+
+@app.get('/api/history')
+async def api_history(_: None = Depends(auth.require_auth)):
+    return {"items": storage.list_analyses()}
+
+
+@app.get('/api/storage')
+async def api_storage(_: None = Depends(auth.require_auth)):
+    return storage.storage_check()
+
+
+@app.delete('/api/history/{analysis_id}')
+async def api_delete(analysis_id: str, _: None = Depends(auth.require_auth)):
+    if not storage.get_analysis(analysis_id):
+        raise HTTPException(404, "Analysis not found")
+    storage.delete_analysis(analysis_id)
+    return {"ok": True}
+
+
+@app.patch('/api/history/{analysis_id}')
+async def api_rename(
+    analysis_id: str, request: Request,
+    _: None = Depends(auth.require_auth),
+):
+    if not storage.get_analysis(analysis_id):
+        raise HTTPException(404, "Analysis not found")
+    body = await request.json()
+    title = (body.get('title') or '').strip()
+    if not title:
+        raise HTTPException(400, "Title cannot be empty")
+    if len(title) > 200:
+        raise HTTPException(400, "Title is too long (200 char max)")
+    storage.update_analysis(analysis_id, title=title)
+    return {"ok": True, "title": title}
+
+
+# ── Submission ────────────────────────────────────────────────────────────────
+
+@app.post('/api/analyze')
+async def api_analyze(
+    request: Request,
+    url: str | None = Form(None),
+    file: UploadFile | None = File(None),
+    _: None = Depends(auth.require_auth),
+):
+    s = storage.storage_check()
+    if s['available_bytes'] <= 0:
+        raise HTTPException(
+            507, f"Storage full ({s['used_gb']}/{s['limit_gb']} GB). "
+                 "Delete old analyses first.")
+
+    # Capture who triggered this analysis so the History list can attribute it.
+    _u = auth.get_user(request) or {}
+    _by_name  = _u.get('name')  or None
+    _by_email = _u.get('email') or None
+
+    if url and url.strip():
+        # Pull the URL out of share-blob pastes ("Title\n\nyoutu.be/...") so
+        # yt-dlp doesn't get the title baked into the URL argument.
+        from modules.downloader import extract_url
+        url = extract_url(url)
+        if not url:
+            raise HTTPException(400, "Couldn't find a YouTube/HTTP URL in your input.")
+        analysis_id = storage.create_analysis(
+            source='youtube', source_url=url,
+            created_by_name=_by_name, created_by_email=_by_email,
+        )
+    elif file and file.filename:
+        ext = Path(file.filename).suffix.lower()
+        if ext not in _VIDEO_EXTS:
+            raise HTTPException(400, f"Unsupported file type: {ext}")
+        analysis_id = storage.create_analysis(
+            source='upload', source_url=file.filename,
+            title=Path(file.filename).stem,
+            created_by_name=_by_name, created_by_email=_by_email,
+        )
+        target = ANALYSES_DIR / analysis_id / f'upload{ext}'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        bytes_written = 0
+        try:
+            with open(target, 'wb') as out:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    bytes_written += len(chunk)
+                    if bytes_written > MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, "File exceeds upload size limit")
+                    if s['used_bytes'] + bytes_written > s['limit_bytes']:
+                        raise HTTPException(507, "Upload would exceed storage limit")
+                    out.write(chunk)
+        except HTTPException:
+            target.unlink(missing_ok=True)
+            storage.delete_analysis(analysis_id)
+            raise
+        storage.update_analysis(analysis_id, source_url=str(target))
+    else:
+        raise HTTPException(400, "Provide either a URL or upload a file")
+
+    jobs.enqueue(analysis_id)
+    return {"id": analysis_id}
+
+
+# ── Job status ────────────────────────────────────────────────────────────────
+
+@app.get('/api/jobs/{analysis_id}')
+async def api_job(analysis_id: str, _: None = Depends(auth.require_auth)):
+    a = storage.get_analysis(analysis_id)
+    if not a:
+        raise HTTPException(404, "Not found")
+    return {**a, "progress": jobs.get_progress(analysis_id)}
+
+
+@app.get('/api/jobs/{analysis_id}/logs')
+async def api_job_logs(
+    analysis_id: str, since: int = 0,
+    _: None = Depends(auth.require_auth),
+):
+    """Live tail of the analyzer's stdout for this job.
+    Pass `?since=<seq>` to fetch only lines newer than the last seq seen."""
+    if not storage.get_analysis(analysis_id):
+        raise HTTPException(404, "Not found")
+    return jobs.get_logs(analysis_id, since=since)
+
+
+# ── Result data ───────────────────────────────────────────────────────────────
+
+@app.get('/api/results/{analysis_id}/data')
+async def api_data(analysis_id: str, _: None = Depends(auth.require_auth)):
+    a = storage.get_analysis(analysis_id)
+    if not a:
+        raise HTTPException(404, "Not found")
+    data_path = ANALYSES_DIR / analysis_id / 'data.json'
+    if not data_path.exists():
+        raise HTTPException(404, "Analysis is not complete yet")
+    with open(data_path, 'r', encoding='utf-8') as f:
+        result = json.load(f)
+    return {"meta": a, "data": result}
+
+
+@app.get('/api/results/{analysis_id}/partial')
+async def api_partial(
+    analysis_id: str, _: None = Depends(auth.require_auth),
+):
+    """Streaming preview while analysis is still running.
+    Returns an incomplete dataset assembled from chunks that have finished so far.
+    Final data.json supersedes this — viewers should switch back to /data when status='done'."""
+    a = storage.get_analysis(analysis_id)
+    if not a:
+        raise HTTPException(404, "Not found")
+    partial_path = ANALYSES_DIR / analysis_id / 'partial.json'
+    if not partial_path.exists():
+        raise HTTPException(404, "No partial data yet")
+    with open(partial_path, 'r', encoding='utf-8') as f:
+        result = json.load(f)
+    return {"meta": a, "data": result}
+
+
+def _find_video(analysis_id: str) -> Path | None:
+    folder = ANALYSES_DIR / analysis_id
+    if not folder.exists():
+        return None
+    primary = folder / 'video.mp4'
+    if primary.exists():
+        return primary
+    for ext in _VIDEO_EXTS:
+        candidate = folder / f'upload{ext}'
+        if candidate.exists():
+            return candidate
+    for p in folder.iterdir():
+        if p.suffix.lower() in _VIDEO_EXTS and p.is_file():
+            return p
+    return None
+
+
+@app.get('/api/results/{analysis_id}/video')
+async def api_video(
+    analysis_id: str, request: Request, _: None = Depends(auth.require_auth),
+):
+    """Serve the video with HTTP Range support so seeking works."""
+    video = _find_video(analysis_id)
+    if not video:
+        raise HTTPException(404, "Video file not found")
+
+    file_size = video.stat().st_size
+    range_header = request.headers.get('range')
+
+    if range_header:
+        m = re.match(r'bytes=(\d+)-(\d*)', range_header)
+        if not m:
+            raise HTTPException(416, "Invalid range")
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else file_size - 1
+        end = min(end, file_size - 1)
+        if start > end:
+            raise HTTPException(416, "Invalid range")
+        length = end - start + 1
+
+        def chunked():
+            with open(video, 'rb') as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        return StreamingResponse(
+            chunked(), status_code=206, media_type='video/mp4',
+            headers={
+                'Content-Range': f'bytes {start}-{end}/{file_size}',
+                'Accept-Ranges': 'bytes',
+                'Content-Length': str(length),
+            },
+        )
+
+    return FileResponse(
+        str(video), media_type='video/mp4',
+        headers={'Accept-Ranges': 'bytes'},
+    )
+
+
+# ── Exports (regenerate static files on demand) ──────────────────────────────
+
+@app.get('/api/results/{analysis_id}/export/{fmt}')
+async def api_export(
+    analysis_id: str, fmt: str,
+    _: None = Depends(auth.require_auth),
+):
+    if fmt not in ('html', 'pdf', 'docx', 'txt'):
+        raise HTTPException(400, "Format must be html, pdf, docx, or txt")
+
+    a = storage.get_analysis(analysis_id)
+    if not a:
+        raise HTTPException(404, "Not found")
+    data_path = ANALYSES_DIR / analysis_id / 'data.json'
+    if not data_path.exists():
+        raise HTTPException(404, "Analysis is not complete yet")
+
+    with open(data_path, 'r', encoding='utf-8') as f:
+        result = json.load(f)
+
+    out_dir = ANALYSES_DIR / analysis_id / 'exports'
+    out_dir.mkdir(exist_ok=True)
+
+    title = a.get('title') or 'analysis'
+    video = _find_video(analysis_id)
+
+    # For YouTube-sourced analyses, point the exported HTML at the YouTube URL
+    # so it gets a slim shareable iframe instead of a local file reference that
+    # only works while the mp4 sits next to the HTML.
+    if a.get('source') == 'youtube' and a.get('source_url'):
+        video_arg = a['source_url']
+    else:
+        video_arg = video.name if video else ''
+
+    # YouTube id (when available) lets the exporters embed clickable
+    # ?t=<seconds> deep-links on every timestamp.
+    yt_id = a.get('yt_id') or ''
+
+    if fmt == 'html':
+        from modules.html_exporter import export_to_html
+        path = export_to_html(result, str(out_dir), title, video_arg)
+    elif fmt == 'pdf':
+        from modules.pdf_exporter import export_to_pdf
+        path = export_to_pdf(result, str(out_dir), title, yt_id=yt_id)
+    elif fmt == 'docx':
+        from modules.exporter import export_to_docx
+        path = export_to_docx(result, str(out_dir), title, yt_id=yt_id)
+    else:
+        from modules.exporter import export_to_txt
+        path = export_to_txt(result, str(out_dir), title, yt_id=yt_id)
+
+    return FileResponse(path, filename=Path(path).name)
+
+
+# ── Comments ──────────────────────────────────────────────────────────────────
+
+@app.get('/api/results/{analysis_id}/comments')
+async def api_comments_list(
+    analysis_id: str, _: None = Depends(auth.require_auth),
+):
+    if not storage.get_analysis(analysis_id):
+        raise HTTPException(404, "Not found")
+    return {"items": storage.list_comments(analysis_id)}
+
+
+_VALID_COMMENT_FIELDS = {'vo', 'desc', 'ost', 'audio', 'summary'}
+
+
+def _parse_field(raw):
+    """Validate the optional anchor `field`. Allow `dialogue:N` or one of the
+    fixed names. Return None for unanchored (legacy) beat-level comments."""
+    if not raw:
+        return None
+    raw = str(raw)
+    if raw in _VALID_COMMENT_FIELDS:
+        return raw
+    if raw.startswith('dialogue:'):
+        try:
+            int(raw.split(':', 1)[1])
+            return raw
+        except ValueError:
+            pass
+    raise HTTPException(400, f"Invalid comment field: {raw!r}")
+
+
+@app.post('/api/results/{analysis_id}/comments')
+async def api_comments_add(
+    analysis_id: str, request: Request,
+    _: None = Depends(auth.require_auth),
+):
+    if not storage.get_analysis(analysis_id):
+        raise HTTPException(404, "Not found")
+    payload = await request.json()
+    try:
+        beat_index = int(payload.get('beat_index', 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "beat_index must be an integer")
+    body = (payload.get('body') or '').strip()
+    if not body:
+        raise HTTPException(400, "Comment body is empty")
+    if len(body) > 4000:
+        raise HTTPException(400, "Comment exceeds 4000 characters")
+    # Fall back to the signed-in user's name when the client didn't send one,
+    # so every comment is attributed to a real person without manual entry.
+    author = (payload.get('author') or '').strip()[:60]
+    if not author:
+        u = auth.get_user(request) or {}
+        author = (u.get('name') or u.get('email') or '').strip()[:60]
+
+    field = _parse_field(payload.get('field'))
+    quote = (payload.get('quote') or '').strip()[:2000] or None
+    start_offset = payload.get('start_offset')
+    end_offset = payload.get('end_offset')
+    if field is not None:
+        try:
+            start_offset = int(start_offset)
+            end_offset = int(end_offset)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "start_offset and end_offset are required for anchored comments")
+        if start_offset < 0 or end_offset <= start_offset:
+            raise HTTPException(400, "Invalid offset range")
+    else:
+        start_offset = end_offset = None
+
+    cid = storage.add_comment(
+        analysis_id, beat_index, body, author,
+        field=field, quote=quote,
+        start_offset=start_offset, end_offset=end_offset,
+    )
+    return {"id": cid, "ok": True}
+
+
+def _current_author(request: Request) -> str:
+    u = auth.get_user(request) or {}
+    return (u.get('name') or u.get('email') or '').strip()[:60]
+
+
+def _require_comment_owner(comment_id: int, request: Request) -> dict:
+    """Load a comment and require the signed-in user to be its author.
+    Resolved (mark-as-done) toggles are allowed by anyone; mutations are not."""
+    comment = storage.get_comment(comment_id)
+    if not comment:
+        raise HTTPException(404, "Comment not found")
+    me = _current_author(request)
+    if not me or comment.get('author') != me:
+        raise HTTPException(403, "You can only modify your own comments")
+    return comment
+
+
+@app.put('/api/comments/{comment_id}')
+async def api_comments_edit(
+    comment_id: int, request: Request,
+    _: None = Depends(auth.require_auth),
+):
+    payload = await request.json()
+    body = payload.get('body')
+    resolved = payload.get('resolved')
+
+    if body is None and resolved is None:
+        raise HTTPException(400, "Nothing to update")
+
+    # Body edits require ownership. Resolved toggles don't —
+    # anyone on the team can mark a comment as addressed.
+    if body is not None:
+        _require_comment_owner(comment_id, request)
+        body = body.strip()
+        if not body:
+            raise HTTPException(400, "Comment body is empty")
+        if len(body) > 4000:
+            raise HTTPException(400, "Comment exceeds 4000 characters")
+    elif not storage.get_comment(comment_id):
+        raise HTTPException(404, "Comment not found")
+
+    if resolved is not None:
+        resolved = bool(resolved)
+
+    storage.update_comment(comment_id, body=body, resolved=resolved)
+    return {"ok": True, "body": body, "resolved": resolved}
+
+
+@app.delete('/api/comments/{comment_id}')
+async def api_comments_delete(
+    comment_id: int, request: Request,
+    _: None = Depends(auth.require_auth),
+):
+    _require_comment_owner(comment_id, request)
+    storage.delete_comment(comment_id)
+    return {"ok": True}
